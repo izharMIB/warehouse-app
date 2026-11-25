@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Markant Warehouse</title>
- <link rel="manifest" href="manifest.json">
+<link rel="manifest" href="manifest.json">
 <meta name="theme-color" content="#000000">
 <link rel="apple-touch-icon" href="icon.svg">
 <meta name="apple-mobile-web-app-capable" content="yes"><script src="https://unpkg.com/html5-qrcode"></script>
@@ -19,6 +19,7 @@
  .qty{font-size:32px;font-weight:bold}
  .row{border-bottom:1px solid #ddd;padding:8px 0}
  .bad{color:#c62828;font-weight:bold} .ok{color:#2e7d32;font-weight:bold}
+ .meta{color:#555;font-size:14px}
 </style>
 </head>
 <body>
@@ -32,7 +33,7 @@
 
 <div id="loginBox" class="card">
   <b>Staff login</b>
-  <input id="staffId" placeholder="Staff ID" autocomplete="username">
+  <input id="staffId" placeholder="Staff ID" autocomplete="username" inputmode="numeric" autocapitalize="off" autocorrect="off" spellcheck="false">
   <input id="pin" type="password" placeholder="Password or PIN" autocomplete="current-password">
   <button onclick="login()">Log in</button>
 </div>
@@ -68,6 +69,16 @@ let counts = JSON.parse(localStorage.getItem('counts') || '{}');
 let found = JSON.parse(localStorage.getItem('found') || '{}');
 
 function $(id) { return document.getElementById(id); }
+let staffNames = {};
+async function loadStaffNames() {
+  const { data } = await sb.from('staff').select('staff_id, full_name');
+  staffNames = {};
+  (data || []).forEach(s => staffNames[s.staff_id] = s.full_name);
+}
+function who(id) { return staffNames[id] ? esc(staffNames[id]) + ' (' + esc(id) + ')' : esc(id); }
+function when(t) {
+  return t ? new Date(t).toLocaleString('en-GB', { day: '2-digit', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit' }) : '';
+}
 function esc(s) { return String(s ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/"/g,'&quot;'); }
 function screen(name) {
   $('loginBox').style.display = name === 'login' ? 'block' : 'none';
@@ -77,8 +88,9 @@ function screen(name) {
 }
 
 async function login() {
-  const id = $('staffId').value.trim().toLowerCase();
+  const id = $('staffId').value.replace(/\s/g, '').toLowerCase().replace(/^0+(?=\d)/, '');
   const pin = $('pin').value.trim();
+  if (!id || !pin) { alert('Enter your staff ID and password'); return; }
   const { error } = await sb.auth.signInWithPassword({ email: id + '@markant.app', password: pin });
   if (error) alert('Wrong staff ID or password');
 }
@@ -101,6 +113,7 @@ async function afterAuth(session) {
   me = data;
   $('who').innerText = 'Logged in: ' + (me.full_name || staffId) + ' (' + staffId + ')';
   ['foundBtn','adminBtn','moveLogBtn'].forEach(b => $(b).style.display = me.is_admin ? 'block' : 'none');
+  if (me.is_admin) loadStaffNames();
   renderMoves();
   renderCounts();
   screen(me.must_change_password ? 'password' : 'app');
@@ -211,16 +224,29 @@ async function openItem(barcode) {
 
 // ---- Admin: review new items ----
 async function loadFound() {
+  await loadStaffNames();
   const { data, error } = await sb.from('found_items').select('*').eq('status', 'pending').order('submitted_at');
   if (error) { alert(error.message); return; }
-  if (!data.length) { $('review').innerHTML = '<div class="card">No new items waiting.</div>'; return; }
   let html = '<div class="card"><b>New items to approve (' + data.length + ')</b>';
+  if (!data.length) html += '<div>No new items waiting.</div>';
   data.forEach(r => {
-    html += `<div class="row"><b>${esc(r.label)}-P${r.pallet}</b> by ${esc(r.staff_id)}<br>
+    html += `<div class="row"><b>${esc(r.label)}-P${r.pallet}</b><br>
       ${esc(r.item_name)} &nbsp; <b>Qty: ${r.qty}</b><br>
+      <span class="meta">Sent by ${who(r.staff_id)}<br>${when(r.submitted_at)}</span><br>
       <button class="small green" onclick="reviewFound(${r.id}, true)">Approve</button>
       <button class="small red" onclick="reviewFound(${r.id}, false)">Reject</button></div>`;
   });
+  const { data: done } = await sb.from('found_items').select('*').neq('status', 'pending').order('reviewed_at', { ascending: false }).limit(30);
+  if (done && done.length) {
+    html += '<hr><b>Recent decisions (last ' + done.length + ')</b>';
+    done.forEach(r => {
+      const tag = r.status === 'approved' ? '<span class="ok">APPROVED</span>' : '<span class="bad">REJECTED</span>';
+      html += `<div class="row"><b>${esc(r.label)}-P${r.pallet}</b> ${tag}<br>
+        ${esc(r.item_name)} &nbsp; <b>Qty: ${r.qty}</b><br>
+        <span class="meta">Sent by ${who(r.staff_id)} · ${when(r.submitted_at)}<br>
+        ${r.status === 'approved' ? 'Approved' : 'Rejected'} by ${who(r.reviewed_by)} · ${when(r.reviewed_at)}</span></div>`;
+    });
+  }
   $('review').innerHTML = html + '</div>';
 }
 
@@ -301,13 +327,14 @@ async function sendMoves() {
 
 // ---- Admin: pick & store history ----
 async function loadMoves() {
+  await loadStaffNames();
   const { data, error } = await sb.from('scan_log').select('*').in('action', ['pick', 'store']).order('created_at', { ascending: false }).limit(100);
   if (error) { alert(error.message); return; }
   if (!data.length) { $('review').innerHTML = '<div class="card">No picks or stores yet.</div>'; return; }
   let html = '<div class="card"><b>Last ' + data.length + ' picks / stores</b>';
   data.forEach(r => {
     const tag = r.action === 'pick' ? '<span class="bad">PICK -' + r.qty + '</span>' : '<span class="ok">STORE +' + r.qty + '</span>';
-    html += `<div class="row"><b>${esc(r.barcode)}</b> ${tag}<br>by ${esc(r.staff_name)} at ${new Date(r.created_at).toLocaleString()}</div>`;
+    html += `<div class="row"><b>${esc(r.barcode)}</b> ${tag}<br><span class="meta">by ${who(r.staff_name)} · ${when(r.created_at)}</span></div>`;
   });
   $('review').innerHTML = html + '</div>';
 }
@@ -369,14 +396,15 @@ async function saveDetails() {
 
 // ---- Admin: review stock take ----
 async function loadReview() {
+  await loadStaffNames();
   const { data, error } = await sb.from('stocktake_counts').select('*').eq('status', 'pending').order('submitted_at');
   if (error) { alert(error.message); return; }
   if (!data.length) { $('review').innerHTML = '<div class="card">No counts waiting for review.</div>'; return; }
   let html = '<div class="card"><b>Pending stock take (' + data.length + ')</b>';
   data.forEach(r => {
     const cls = r.difference === 0 ? 'ok' : 'bad';
-    html += `<div class="row"><b>${esc(r.barcode)}</b> by ${esc(r.staff_id)}<br>
-      ${new Date(r.submitted_at).toLocaleString()}<br>
+    html += `<div class="row"><b>${esc(r.barcode)}</b><br>
+      <span class="meta">Sent by ${who(r.staff_id)} · ${when(r.submitted_at)}</span><br>
       System: ${r.system_qty} &nbsp; Counted: ${r.counted_qty} &nbsp; <span class="${cls}">Diff: ${r.difference}</span><br>
       <button class="small green" onclick="review(${r.id}, true)">Approve</button>
       <button class="small red" onclick="review(${r.id}, false)">Reject</button></div>`;

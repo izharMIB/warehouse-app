@@ -1,0 +1,288 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Markant Warehouse</title>
+<script src="https://unpkg.com/html5-qrcode"></script>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+<style>
+ body{font-family:sans-serif;margin:0;padding:16px;background:#f4f4f4}
+ .card{background:#fff;border-radius:10px;padding:16px;margin-top:12px}
+ button{font-size:18px;padding:12px;width:100%;margin-top:8px;border:0;border-radius:8px;background:#1565c0;color:#fff}
+ button.grey{background:#777} button.green{background:#2e7d32} button.red{background:#c62828}
+ button.small{width:auto;font-size:15px;padding:8px 12px;margin:4px 4px 0 0}
+ input{font-size:18px;padding:10px;width:100%;box-sizing:border-box;margin-top:8px}
+ .qty{font-size:32px;font-weight:bold}
+ .row{border-bottom:1px solid #ddd;padding:8px 0}
+ .bad{color:#c62828;font-weight:bold} .ok{color:#2e7d32;font-weight:bold}
+</style>
+</head>
+<body>
+<div style="display:flex;align-items:center;gap:12px">
+  <svg width="48" height="48" viewBox="0 0 100 100" aria-label="Markant logo">
+    <rect width="100" height="100" rx="14" fill="#000"/>
+    <path d="M22 78V24h12l16 26 16-26h12v54H66V45L50 70 34 45v33z" fill="#fff"/>
+  </svg>
+  <h2 style="margin:0">Markant Warehouse</h2>
+</div>
+
+<div id="loginBox" class="card">
+  <b>Staff login</b>
+  <input id="staffId" placeholder="Staff ID" autocomplete="username">
+  <input id="pin" type="password" placeholder="Password or PIN" autocomplete="current-password">
+  <button onclick="login()">Log in</button>
+</div>
+
+<div id="pwBox" class="card" style="display:none">
+  <b>Create your own password</b>
+  <div>At least 6 characters. Do not share it.</div>
+  <input id="newPw" type="password" placeholder="New password" autocomplete="new-password">
+  <input id="newPw2" type="password" placeholder="Repeat new password" autocomplete="new-password">
+  <button onclick="setPassword()">Save password</button>
+</div>
+
+<div id="appBox" style="display:none">
+  <div id="who"></div>
+  <div id="reader"></div>
+  <button onclick="startScan()">Scan barcode</button>
+  <div id="result"></div>
+  <div id="moveList"></div>
+  <div id="countList"></div>
+  <button id="adminBtn" class="grey" style="display:none" onclick="loadReview()">Admin: review stock take</button>
+  <button id="moveLogBtn" class="grey" style="display:none" onclick="loadMoves()">Admin: pick &amp; store history</button>
+  <div id="review"></div>
+</div>
+
+<button id="logoutBtn" class="grey" style="display:none" onclick="logout()">Log out</button>
+
+<script>
+const sb = supabase.createClient('https://emmgvxtsczaxtdaunfes.supabase.co', 'sb_publishable_49iqF3mNy5Az794EolfcbA_0mEm9mru');
+const scanner = new Html5Qrcode('reader');
+let current = null, me = null;
+let counts = JSON.parse(localStorage.getItem('counts') || '{}');
+
+function $(id) { return document.getElementById(id); }
+function screen(name) {
+  $('loginBox').style.display = name === 'login' ? 'block' : 'none';
+  $('pwBox').style.display = name === 'password' ? 'block' : 'none';
+  $('appBox').style.display = name === 'app' ? 'block' : 'none';
+  $('logoutBtn').style.display = name === 'login' ? 'none' : 'block';
+}
+
+async function login() {
+  const id = $('staffId').value.trim().toLowerCase();
+  const pin = $('pin').value.trim();
+  const { error } = await sb.auth.signInWithPassword({ email: id + '@markant.app', password: pin });
+  if (error) alert('Wrong staff ID or password');
+}
+
+async function logout() {
+  try { await scanner.stop(); } catch (e) {}
+  await sb.auth.signOut();
+}
+
+sb.auth.onAuthStateChange((event, session) => { setTimeout(() => afterAuth(session), 0); });
+
+async function afterAuth(session) {
+  if (!session) { $('result').innerHTML = ''; $('review').innerHTML = ''; $('pin').value = ''; screen('login'); return; }
+  const staffId = session.user.email.split('@')[0].toUpperCase();
+  const { data } = await sb.from('staff').select('*').eq('staff_id', staffId).maybeSingle();
+  if (!data) { alert('You are not on the staff list. Please contact your supervisor.'); await sb.auth.signOut(); return; }
+  me = data;
+  $('who').innerText = 'Logged in: ' + (me.full_name || staffId) + ' (' + staffId + ')';
+  $('adminBtn').style.display = me.is_admin ? 'block' : 'none';
+  $('moveLogBtn').style.display = me.is_admin ? 'block' : 'none';
+  renderMoves();
+  renderCounts();
+  screen(me.must_change_password ? 'password' : 'app');
+}
+
+async function setPassword() {
+  const p1 = $('newPw').value, p2 = $('newPw2').value;
+  if (p1.length < 6) { alert('Password must be at least 6 characters'); return; }
+  if (p1 !== p2) { alert('Passwords do not match'); return; }
+  const { error } = await sb.auth.updateUser({ password: p1 });
+  if (error) { alert(error.message); return; }
+  await sb.rpc('password_changed');
+  $('newPw').value = ''; $('newPw2').value = '';
+  alert('Password saved. Use it next time you log in.');
+  screen('app');
+}
+
+function startScan() {
+  $('result').innerHTML = '';
+  scanner.start({ facingMode: 'environment' }, { fps: 10, qrbox: 250 }, onScan);
+}
+
+async function onScan(code) {
+  await scanner.stop();
+  const { data } = await sb.from('locations').select('*').eq('barcode', code).maybeSingle();
+  await sb.from('scan_log').insert({ barcode: code, action: 'scan' });
+  if (!data) { show('<b>Not found:</b> ' + code); return; }
+  current = data;
+  render();
+}
+
+function render() {
+  const d = current;
+  const already = counts[d.barcode] ? counts[d.barcode].qty : '';
+  show(`<div><b>Rack:</b> ${d.rack_no} &nbsp; <b>Level:</b> ${d.level}</div>
+    <div><b>Item:</b> ${d.product_code}</div>
+    <div>${d.description}</div>
+    <div class="qty">Qty: ${d.quantity}</div>
+    <hr><b>Pick / Store</b>
+    <input id="moveQty" type="number" min="1" placeholder="Quantity">
+    <button onclick="addMove('pick')">Add to list: Pick (take out)</button>
+    <button class="green" onclick="addMove('store')">Add to list: Store (put in)</button>
+    <hr><b>Stock take</b>
+    <input id="countQty" type="number" min="0" placeholder="Quantity counted" value="${already}">
+    <button class="green" onclick="addCount()">Save count to my list</button>
+    ${me && me.is_admin ? `<hr><b>Admin: edit rack details</b>
+    <input id="edRack" placeholder="Rack no" value="${d.rack_no || ''}">
+    <input id="edLevel" placeholder="Level" value="${d.level || ''}">
+    <input id="edCode" placeholder="Product code" value="${d.product_code || ''}">
+    <input id="edDesc" placeholder="Description" value="${(d.description || '').replace(/"/g, '&quot;')}">
+    <button class="grey" onclick="saveDetails()">Save details</button>` : ''}`);
+}
+
+// Pick / Store list kept on the phone until Send
+let moves = JSON.parse(localStorage.getItem('moves') || '[]');
+function saveMoves() { localStorage.setItem('moves', JSON.stringify(moves)); renderMoves(); }
+
+function addMove(type) {
+  const qty = parseInt($('moveQty').value);
+  if (!qty || qty < 1) { alert('Enter a quantity'); return; }
+  moves.push({ barcode: current.barcode, type, qty, label: current.rack_no + '-' + current.level + ' ' + current.description });
+  $('moveQty').value = '';
+  saveMoves();
+}
+
+function editMove(i) {
+  const v = prompt('Correct quantity (' + moves[i].type + ') for ' + moves[i].label, moves[i].qty);
+  if (v === null) return;
+  const qty = parseInt(v);
+  if (!qty || qty < 1) { alert('Invalid number'); return; }
+  moves[i].qty = qty; saveMoves();
+}
+
+function removeMove(i) { moves.splice(i, 1); saveMoves(); }
+
+function renderMoves() {
+  if (!moves.length) { $('moveList').innerHTML = ''; return; }
+  let html = '<div class="card"><b>My pick / store list (' + moves.length + ')</b>';
+  moves.forEach((m, i) => {
+    const tag = m.type === 'pick' ? '<span class="bad">PICK -' + m.qty + '</span>' : '<span class="ok">STORE +' + m.qty + '</span>';
+    html += `<div class="row">${m.label}<br>${tag}<br>
+      <button class="small" onclick="editMove(${i})">Edit</button>
+      <button class="small red" onclick="removeMove(${i})">Remove</button></div>`;
+  });
+  html += '<button onclick="sendMoves()">Send (cannot edit after)</button></div>';
+  $('moveList').innerHTML = html;
+}
+
+async function sendMoves() {
+  if (!confirm('Send ' + moves.length + ' lines? You cannot edit them after sending.')) return;
+  const list = moves.map(m => ({ barcode: m.barcode, type: m.type, qty: m.qty }));
+  const { data, error } = await sb.rpc('submit_movements', { p_moves: list });
+  if (error) { alert('Nothing was sent: ' + error.message); return; }
+  moves = []; saveMoves();
+  if (current) { const { data: d } = await sb.from('locations').select('*').eq('barcode', current.barcode).maybeSingle(); if (d) { current = d; render(); } }
+  alert('Sent ' + data + ' lines. Stock updated.');
+}
+
+// Admin: pick and store history
+async function loadMoves() {
+  const { data, error } = await sb.from('scan_log').select('*').in('action', ['pick', 'store']).order('created_at', { ascending: false }).limit(100);
+  if (error) { alert(error.message); return; }
+  if (!data.length) { $('review').innerHTML = '<div class="card">No picks or stores yet.</div>'; return; }
+  let html = '<div class="card"><b>Last ' + data.length + ' picks / stores</b>';
+  data.forEach(r => {
+    const tag = r.action === 'pick' ? '<span class="bad">PICK -' + r.qty + '</span>' : '<span class="ok">STORE +' + r.qty + '</span>';
+    html += `<div class="row"><b>${r.barcode}</b> ${tag}<br>by ${r.staff_name} at ${new Date(r.created_at).toLocaleString()}</div>`;
+  });
+  $('review').innerHTML = html + '</div>';
+}
+
+// Stock take list kept on the phone until Submit
+function saveCounts() { localStorage.setItem('counts', JSON.stringify(counts)); renderCounts(); }
+
+function addCount() {
+  const qty = parseInt($('countQty').value);
+  if (isNaN(qty) || qty < 0) { alert('Enter the counted quantity'); return; }
+  counts[current.barcode] = { qty, label: current.rack_no + '-' + current.level + ' ' + current.description };
+  saveCounts();
+  alert('Saved to your stock take list');
+}
+
+function editCount(code) {
+  const v = prompt('Correct quantity for ' + counts[code].label, counts[code].qty);
+  if (v === null) return;
+  const qty = parseInt(v);
+  if (isNaN(qty) || qty < 0) { alert('Invalid number'); return; }
+  counts[code].qty = qty; saveCounts();
+}
+
+function removeCount(code) { delete counts[code]; saveCounts(); }
+
+function renderCounts() {
+  const codes = Object.keys(counts);
+  if (!codes.length) { $('countList').innerHTML = ''; return; }
+  let html = '<div class="card"><b>My stock take list (' + codes.length + ')</b>';
+  codes.forEach(c => {
+    html += `<div class="row">${counts[c].label}<br><b>Counted: ${counts[c].qty}</b><br>
+      <button class="small" onclick="editCount('${c}')">Edit</button>
+      <button class="small red" onclick="removeCount('${c}')">Remove</button></div>`;
+  });
+  html += '<button class="green" onclick="submitCounts()">Confirm and submit all</button></div>';
+  $('countList').innerHTML = html;
+}
+
+async function submitCounts() {
+  const list = Object.keys(counts).map(c => ({ barcode: c, qty: counts[c].qty }));
+  if (!confirm('Submit ' + list.length + ' counts? Check all quantities are correct.')) return;
+  const { data, error } = await sb.rpc('submit_counts', { p_counts: list });
+  if (error) { alert(error.message); return; }
+  counts = {}; saveCounts();
+  alert('Submitted ' + data + ' counts. Thank you!');
+}
+
+// Admin: edit rack details
+async function saveDetails() {
+  const p = { p_barcode: current.barcode, p_rack: $('edRack').value.trim(), p_level: $('edLevel').value.trim(),
+              p_code: $('edCode').value.trim(), p_desc: $('edDesc').value.trim() };
+  if (!confirm('Save these details for ' + current.barcode + '?')) return;
+  const { error } = await sb.rpc('update_location', p);
+  if (error) { alert(error.message); return; }
+  Object.assign(current, { rack_no: p.p_rack, level: p.p_level, product_code: p.p_code, description: p.p_desc });
+  render();
+  alert('Details saved');
+}
+
+// Admin: review stock take
+async function loadReview() {
+  const { data, error } = await sb.from('stocktake_counts').select('*').eq('status', 'pending').order('submitted_at');
+  if (error) { alert(error.message); return; }
+  if (!data.length) { $('review').innerHTML = '<div class="card">No counts waiting for review.</div>'; return; }
+  let html = '<div class="card"><b>Pending stock take (' + data.length + ')</b>';
+  data.forEach(r => {
+    const cls = r.difference === 0 ? 'ok' : 'bad';
+    html += `<div class="row"><b>${r.barcode}</b> by ${r.staff_id}<br>
+      ${new Date(r.submitted_at).toLocaleString()}<br>
+      System: ${r.system_qty} &nbsp; Counted: ${r.counted_qty} &nbsp; <span class="${cls}">Diff: ${r.difference}</span><br>
+      <button class="small green" onclick="review(${r.id}, true)">Approve</button>
+      <button class="small red" onclick="review(${r.id}, false)">Reject</button></div>`;
+  });
+  $('review').innerHTML = html + '</div>';
+}
+
+async function review(id, approve) {
+  const { error } = await sb.rpc('review_count', { p_id: id, p_approve: approve });
+  if (error) { alert(error.message); return; }
+  loadReview();
+}
+
+function show(html) { $('result').innerHTML = '<div class="card">' + html + '</div>'; }
+</script>
+</body>
+</html>

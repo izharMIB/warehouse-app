@@ -69,6 +69,7 @@ let counts = JSON.parse(localStorage.getItem('counts') || '{}');
 let found = JSON.parse(localStorage.getItem('found') || '{}');
 
 function $(id) { return document.getElementById(id); }
+const qid = new URLSearchParams(location.search).get('id'); if (qid) document.getElementById('staffId').value = qid;
 let staffNames = {};
 async function loadStaffNames() {
   const { data } = await sb.from('staff').select('staff_id, full_name');
